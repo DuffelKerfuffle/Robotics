@@ -1,79 +1,63 @@
 from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image, ImageOps
+import os, random, shutil
 
 class ConvLayer():
-    def __init__(self, learning_rate, img, filters):
+    def __init__(self, learning_rate, images, filters):
         self.learning_rate = learning_rate
-        self.img = img # n, 3, w, h
+        self.images = images # n, 3, w, h
         self.filters = filters # f, 3, k, k
 
-
-    def forwardBatch(self, images):
+    def forward(self, images):
         self.images = images
         patches = sliding_window_view(
             images, 
             (self.filters.shape[2],self.filters.shape[3]), 
-            (1, 2)
-        )
-        patches = patches.transpose(1, 2, 0, 3, 4)
-        
-        activationMap = np.sum(
-            patches[None, ...] * self.filters[:, None, None, :, :, :],
-            axis=(3, 4, 5)
+            (2, 3)
         )
 
-        return activationMap
-    
-    def backwardBatch(self, dOutput):
-        _, kH, kW = self.filters.shape
-        _, outH, outW = dOutput.shape
+        # activationMap: (F, N, outH, outW)
+        activationMap = np.tensordot(
+            self.filters,   # (F, C, kH, kW)
+            patches,        # (N, C, outH, outW, kH, kW)
+            axes=([1,2,3], [1,4,5])
+        )
+        # tensordot gives (F, N, outH, outW) → swap to (N, F, outH, outW)
+        return activationMap.transpose(1, 0, 2, 3)
 
-        dInput = np.zeros((self.img.shape))
-        dFilters = np.zeros((self.filters.shape))  
+    def backward(self, dOutput):
+        _, _, kH, kW = self.filters.shape
+        _, _, outH, outW = dOutput.shape  # ← unpack 4 dims
+
+        dInput = np.zeros(self.images.shape)  # (N, C, inH, inW)
+
+        # gets patches which are the size of filters, turns into a list of patches
         
         patches = sliding_window_view(
-            dOutput, 
-            (self.filters.shape[2],self.filters.shape[3]), 
-            (1, 2)
-        )
-        patches = patches[None, ...]   
-        dOutput = dOutput[:, :, :, None, None, None]  
- 
-        dFilters = np.sum(
-            patches * dOutput,
-            axis=(1, 2)
+            self.images,
+            (kH, kW),
+            (2, 3)
         )
 
-        filters = self.filters[:, None, None, :, :, :] 
-        contrib = dOutput * filters                     # (F, H, W, C, kH, kW)
+        # find dot product over gradient and patches, condensing image dimensions since we're creating filters
+        dFilters = np.tensordot(
+            dOutput,   # (N, F, outH, outW)
+            patches,   # (N, C, outH, outW, kH, kW)
+            axes=([0, 2, 3], [0, 2, 3])  # sum over N, outH, outW
+        )
 
+        
         for i in range(kH):
             for j in range(kW):
-                dInput[:, i:i+outH, j:j+outW] += np.sum(
-                    contrib[:, :, :, :, i, j],
-                    axis=0
-                )
-        
+                # apply filters to output matrix, by applying weights at each index across channels and filters
+                contrib = np.tensordot(dOutput, self.filters[:, :, i, j], axes=([1], [0]))
+                dInput[:, :, i:i+outH, j:j+outW] += contrib.transpose(0, 3, 1, 2)
+
         self.dFilters = dFilters
         return dInput
-
-    # def backward(self, dOutput):
-    #     _, kH, kW = self.filters.shape
-    #     outH = dOutput.shape[1]
-    #     outW = dOutput.shape[2]
-    #     dInput = np.zeros((self.img.shape))
-    #     dFilters = np.zeros((self.filters.shape))
-
-    #     for a in range(dFilters.shape[0]):
-    #         for i in range(outH):
-    #             for j in range(outW):
-                    
-    #                 patch = self.img[:, i:i+kH, j:j+kW]
-    #                 dFilters[a] += patch * dOutput[a, i, j] 
-    #                 dInput[:, i:i+kH, j:j+kW] += self.filters[a] * dOutput[a, i, j]
-                
-    #     self.dFilters = dFilters
-    #     return dInput
     
     def update(self):
         self.filters -= self.learning_rate * self.dFilters
@@ -96,51 +80,80 @@ class MaxPool():
 
     def forward(self, matrix):
         self.matrix = matrix
-        output = np.zeros((matrix.shape[0], matrix.shape[1]//self.spanx, matrix.shape[2]//self.spany))
-        for h in range(0, matrix.shape[0]):
-            for i in range(0, matrix.shape[1], self.spanx):
-                for j in range(0, matrix.shape[2], self.spany):
-                    output[h, i//self.spanx, j//self.spany] = np.max(matrix[h, i:i+self.spanx, j:j+self.spany])
-        return output
+        
+        # get all patches
+        windows = sliding_window_view(
+            matrix, 
+            (self.spanx, self.spany), 
+            (2, 3)
+        )
+        
+        # get every other patch, so no overlapping patches
+        windows = windows[:, :, ::self.spanx, ::self.spany, :, :]    
 
-    def backward(self, matrix, dA):
-        output = np.zeros(matrix.shape)
-        for h in range(0, matrix.shape[0]):
-            for i in range(0, matrix.shape[1] - self.spanx + 1, self.spanx):
-                for j in range(0, matrix.shape[2] - self.spany + 1, self.spany):
-                    idx = np.argmax(matrix[h, i:i+self.spanx, j:j+self.spany])
+        #find max of each patch to collapse them
+        return np.max(windows, axis=(4, 5))
 
-                    row, col = np.unravel_index(idx, (self.spanx, self.spany))
-                    output[h, i+ row, j+col] = dA[h, i//self.spanx, j//self.spany] 
+    def backward(self, dA):
+        N, F, H, W = self.matrix.shape
+        outH, outW = dA.shape[2], dA.shape[3]
+
+        # get all patches
+        windows = sliding_window_view(
+            self.matrix, 
+            (self.spanx, self.spany), 
+            (2, 3)
+        )
+
+        # get only overlapping patches
+        windows = windows[:, :, ::self.spanx, ::self.spany]
+
+        # flatten each window to 1d, finds max for each window
+        flat = windows.reshape(N, F, outH, outW, -1)
+        idx = np.argmax(flat, axis=-1) 
+
+        #convert flat index into row/column index
+        rows, cols = np.unravel_index(idx, (self.spanx, self.spany))
+        
+        # get top left row of EACH window
+        base_i = np.arange(outH)[:, None] * self.spanx  
+        base_j = np.arange(outW)[None, :] * self.spany  
+
+        # get absolute position from RELATIVE position of max
+        abs_rows = rows + base_i  
+        abs_cols = cols + base_j  
+
+        # add max dA values at the correct rows and columns
+        output = np.zeros(self.matrix.shape)
+        n_idx = np.arange(N)[:, None, None, None]
+        f_idx = np.arange(F)[None, :, None, None]
+        np.add.at(output, (n_idx, f_idx, abs_rows, abs_cols), dA)
+
         return output
 
 class Dense():
-    def __init__(self, learning_rate):
+    def __init__(self, learning_rate, input_size, output_size):
         self.learning_rate = learning_rate
-        self.weights = np.random.randn(128, 15) * 0.01
-        self.biases = np.zeros(15)
+        self.weights = np.random.randn(input_size, output_size) * 0.01
+        self.biases = np.zeros(output_size)
     
     def forward(self, matrix):
-        flat = matrix.flatten()
+        self.original_shape = matrix.shape 
+        flat = matrix.reshape(matrix.shape[0], -1)
         self.input = flat
         return Softmax().forward(flat.dot(self.weights) + self.biases)
 
     def backward(self, pred, actual):
-        error = self.Loss(pred, actual)
+        error = (pred - actual) / pred.shape[0]
+        self.dW = self.input.T @ error
+        self.db = np.sum(error, axis=0)
 
-        dW = np.outer(self.input, error)  # shape: (n_features, n_classes)
-        db = error  # shape: (n_classes,)
-        
-        # Step 3: gradient w.r.t input (for backprop to previous layer)
-        dInput = error.dot(self.weights.T)  # shape: (n_features,)
-        dInput = dInput.reshape(self.input.shape)  # reshape if needed
-        
-        # Store gradients for optimizer
-        self.dW = dW
-        self.db = db
+        dInput_flat = error @ self.weights.T
+        self.dInput = dInput_flat.reshape(self.original_shape) 
 
-    def Loss(pred, target):
-        return -np.sum(np.log(pred+1e-9) * target)
+    @staticmethod
+    def loss(pred, target):
+        return -np.mean(np.sum(target * np.log(pred + 1e-9), axis=1))
     
     def update(self):
         self.weights -= self.learning_rate * self.dW
@@ -148,53 +161,220 @@ class Dense():
 
 class Softmax():
     def forward(self, x):
-        e_x = np.exp(x - np.max(x))
-        self.pred = e_x / np.sum(e_x)
+        e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+        self.pred = e_x / np.sum(e_x, axis=1, keepdims=True)
         return self.pred
 
+def one_hot(labels, num_classes=10):
+    return np.eye(num_classes)[labels]
 F = 16
-C = 3
 k = 3
 
-filters1 = np.random.randn(16, C, k, k) * np.sqrt(2 / (C * k * k))
-filters2 = np.random.randn(32, C, k, k) * np.sqrt(2 / (16 * k * k))
-filters3 = np.random.randn(32, C, k, k) * np.sqrt(2 / (C * k * k))
+filters1 = np.random.randn(16, 1, k, k) * np.sqrt(2 / (1 * k * k))
+filters2 = np.random.randn(32, 16, k, k) * np.sqrt(2 / (16 * k * k))
+filters3 = np.random.randn(64, 32, k, k) * np.sqrt(2 / (32 * k * k))
 
-convolution1 = ConvLayer(0.01, None, filters1)
-# convolution2 = ConvLayer(0.01, imgs, filters2)
-# convolution3 = ConvLayer(0.01, imgs, filters3)
+conv1 = ConvLayer(0.001, None, filters1)
+conv2 = ConvLayer(0.001, None, filters2)
+conv3 = ConvLayer(0.001, None, filters3)
 
-r = ReLU()
-pool = MaxPool(2, 2)
+r1, r2, r3 = ReLU(), ReLU(), ReLU()
+pool1, pool2, pool3 = MaxPool(2, 2), MaxPool(2, 2), MaxPool(2, 2)
 
-d = Dense(0.01)
+d = Dense(0.001, 64 * 6 * 6, 10)
 
-def forward(img):
-    x = convolution1.forward(img)
-    x = r.forward(x)
-    x = pool.forward(x)
+root_folder = Path("Dataset")
+TARGET_SIZE = (64, 64) 
+def initialise():
+    for subfolder in root_folder.iterdir():
+        if subfolder.is_dir():
+            print(f"\nFolder: {subfolder.name}")
+            
+            numbers = list(range(1, 16))
+            random.shuffle(numbers)
+            for sub in subfolder.iterdir():
+                for file in sub.iterdir():
+                    if file.suffix.lower() == '.png':
+                        with Image.open(file) as img:
+                            
+                            img = img.convert("L")
+                            img = ImageOps.pad(img, (64, 64), color=(0))
+                            img.save(file)
+                            
+                            for angle in [90, 180, 270]:
+                                rotated = img.rotate(angle, expand=True)
+
+                                new_name = file.stem + f"_{angle}.png"
+                                new_path = file.with_name(new_name)
+
+                                rotated.save(new_path)
+
+def rearrange():        
+    for subfolder in root_folder.iterdir():
+        if subfolder.is_dir():
+            os.makedirs(root_folder / subfolder.name / "training", exist_ok=True)
+            os.makedirs(root_folder / subfolder.name / "validation", exist_ok=True)
+            os.makedirs(root_folder / subfolder.name / "testing", exist_ok=True)
+
+            fileList = []
+            for file in subfolder.iterdir():
+                if file.suffix.lower() == '.png':
+                    fileList.append(file)
+                
+            random.shuffle(fileList)
+
+            for i in range(10):
+                shutil.move(str(fileList[i]), root_folder / subfolder.name / "training" / fileList[i].name)
+            for i in range(10, 13):
+                shutil.move(str(fileList[i]), root_folder / subfolder.name / "validation" / fileList[i].name)
+            for i in range(13, 15):
+                shutil.move(str(fileList[i]), root_folder / subfolder.name / "testing" / fileList[i].name)
+
+def loadData(folder):
+    inputs = []
+    outputs = []
+
+    for subfolder in root_folder.iterdir():
+        if subfolder.is_dir():
+            target = int(subfolder.name)
+            sub = subfolder / folder
+            for file in sub.iterdir():
+                if file.is_file() and file.suffix.lower() == '.png':
+                    with Image.open(file) as img:
+                        img = img.convert("L")
+                        inputs.append(np.array(img))
+                    outputs.append(target-1)
+    out = np.array(inputs)          # shape: (N, H, W)
+    out = out[:, np.newaxis, :, :]  # shape: (N, 1, H, W) — add channel dimension
+    out = out / 255.0
     
+    return out, one_hot(np.array(outputs))
+
+def forward(images):
+    x = conv1.forward(images)
+    x = r1.forward(x)
+    x = pool1.forward(x)
+
+    x = conv2.forward(x)
+    x = r2.forward(x)
+    x = pool2.forward(x)
+
+    x = conv3.forward(x)
+    x = r3.forward(x)
+    x = pool3.forward(x)
+
     pred = d.forward(x)
-    return pred, x
+    return pred
 
-
-def backward(pred, target, pooled_output):
-    # Loss gradient
-    loss = d.loss(pred, target)
-
-    # Dense layer
+def backward(pred, target):
     d.backward(pred, target)
-    dDense = d.dInput.reshape(pooled_output.shape)
+    dx = d.dInput  
+    
+    dx = pool3.backward(dx)
+    dx = r3.backward(dx)
+    dx = conv3.backward(dx)
 
-    # Pool layer
-    dPool = pool.backward(r.matrix, dDense)
+    dx = pool2.backward(dx)
+    dx = r2.backward(dx)
+    dx = conv2.backward(dx)
 
-    # ReLU
-    dRelu = r.backward(dPool)
+    dx = pool1.backward(dx)
+    dx = r1.backward(dx)
+    dx = conv1.backward(dx)
 
-    # Conv
-    convolution1.backward(dRelu)
+    conv1.update()
+    conv2.update()
+    conv3.update()
+    d.update()
 
-epochs = 3
 
-for i in range(epochs)
+if __name__ == "__main__":
+    trainingImages, trainingTarget = loadData("training")
+    testingImages, testingTarget = loadData("testing")
+    validationImages, validationTarget = loadData("validation")
+
+    cars = {
+        1: "Toyota Prius",
+        2: "Ford Focus",
+        3: "Ferrari f40",
+        4: "BMW E30 cross spoke",
+        5: "Porsche 911",
+        6: "BMW m3",
+        7: "Audi",
+        8: "Mercedes Benz E-class",
+        9: "Tesla Model 3",
+        10: "Jaguar XJ9220"
+    }
+
+    trainingList = []
+    validationList = []
+
+    maxepochs = 500
+    i = 0
+    count = 0
+    while i < maxepochs:
+        i += 1
+        print("forward", i)
+        trainingPred = forward(trainingImages)
+        trainingError = Dense.loss(trainingPred, trainingTarget)
+
+        trainingList.append(trainingError)
+
+        print("backward", i)
+        backward(trainingPred, trainingTarget)
+
+        validationPred = forward(validationImages)
+        validationError = Dense.loss(validationPred, validationTarget)
+        print(f"Epoch {i+1}: train loss {trainingError:.4f}, val loss {validationError:.4f}")
+        if(len(validationList)) > 0:
+            if(validationList[-1] <= validationError):
+                count += 1
+            else:
+                count = 0
+        if(count == 10):
+            break
+
+        validationList.append(validationError)
+
+    testPred = forward(testingImages)
+    testError = Dense.loss(testPred, testingTarget)
+
+    predicted_classes = np.argmax(testPred, axis=1)
+    true_classes      = np.argmax(testingTarget, axis=1)
+    accuracy = np.mean(predicted_classes == true_classes)
+
+    print(f"Test loss: {testError:.4f}")
+    print(f"Test accuracy: {accuracy * 100:.2f}%")
+
+    plt.plot(trainingList, label="Train loss")
+    plt.plot(validationList, label="Val loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.savefig("training_curves.png")
+    plt.show()
+
+    with open("losses.txt", "w") as f:
+        f.write("epoch,train_loss,val_loss\n")
+        for i, (t, v) in enumerate(zip(trainingList, validationList)):
+            f.write(f"{i+1},{t:.6f},{v:.6f}\n")
+
+def saveModel(path="model"):
+    np.save(f"{path}/filters1.npy", conv1.filters)
+    np.save(f"{path}/filters2.npy", conv2.filters)
+    np.save(f"{path}/filters3.npy", conv3.filters)
+    np.save(f"{path}/weights.npy", d.weights)
+    np.save(f"{path}/biases.npy", d.biases)
+    print(f"Model saved to {path}/")
+
+def loadModel(path="model"):
+    conv1.filters = np.load(f"{path}/filters1.npy")
+    conv2.filters = np.load(f"{path}/filters2.npy")
+    conv3.filters = np.load(f"{path}/filters3.npy")
+    d.weights     = np.load(f"{path}/weights.npy")
+    d.biases      = np.load(f"{path}/biases.npy")
+    print(f"Model loaded from {path}/")
+
+if __name__ == "__main__":
+    os.makedirs("model", exist_ok=True)
+    saveModel() 
